@@ -1,0 +1,29 @@
+# Local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.venv312/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Runtime documents and catalog
+backend/data/
+
+# Frontend dependencies and build output
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+next-env.d.ts
+
+# Local tooling
+AGENTS.md
+.DS_Store
+Thumbs.db
+*.log

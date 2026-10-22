@@ -1,178 +1,325 @@
-# Short‑Term Downlink Throughput Prediction on Trains
+# RAG Agent
 
-> **Thesis companion repository.** This repo contains data collection utilities, feature engineering, and model pipelines to perform **t → t+1** one‑step prediction of cellular **downlink throughput (Mbps)** at 1 Hz in a real commuter‑rail setting.
+A document question-answering system built with LangChain and LangGraph, backed by Elasticsearch and served through a Next.js interface. Upload documents, extract text with OCR when needed, and ask questions against selected sources. The ingestion pipeline supports document-level incremental updates; answers include retrieved passages and page references when available.
 
-The work uses real‑world measurements collected on the Dublin DART line with multiple USB modems (different operators) and phone GPS. We engineer strictly‑causal features and evaluate several models under a leakage‑safe time‑ordered split.
+## Table of Contents
 
----
+- [Architecture Overview](#architecture-overview)
+- [Document Ingestion](#document-ingestion)
+- [Incremental Updates](#incremental-updates)
+- [Retrieval Graph](#retrieval-graph)
+- [Technology Stack](#technology-stack)
+- [Project Structure](#project-structure)
+- [Backend API Reference](#backend-api-reference)
+- [Frontend](#frontend)
+- [Configuration](#configuration)
+- [Getting Started](#getting-started)
+- [Verification](#verification)
+- [Current Scope](#current-scope)
 
-## ✨ Highlights
+## Architecture Overview
 
-- **Real data collection pipeline:** Linux SBC + ModemManager (`mmcli`) for radio KPIs; continuous reverse‑direction `iperf3` downlink to measure per‑second throughput; 1 Hz GPS from a phone, with UTC alignment.
-- **Leakage‑safe evaluation:** **80/20 chronological split** with a **25 s embargo** before the test window to cover the longest lag (20 s) + safety margin.
-- **Causal features:** Current values, short histories (throughput lags up to **20 s**, radio KPI lags up to **3 s**), 5‑second rolling statistics (mean/std/min/max), momentum/differences, volatility, and simple state flags (e.g., handover).
-- **Model zoo:** Persistence & **AR(1)** baselines; classical ML (**Random Forest**), **ANN/MLP**; sequence model **TCN**; and a **TCN+DQN** hybrid variant.
-- **Key finding (from the thesis):** On held‑out tests for two representative modems, **Random Forest** achieves **R² ≈ 0.53/0.37** with **MAE ≈ 17.1/19.5 Mbps**, clearly outperforming linear AR(1) (negative R², MAE ≈ 35.6/33.2 Mbps).
+The Next.js frontend sends document and chat requests through a server-side proxy to FastAPI. The backend manages uploads and document versions in local files and SQLite, then invokes separate LangGraph workflows for indexing and retrieval. Elasticsearch stores document chunks, embeddings and retrieval metadata; OpenAI models provide embeddings, query rewriting and answers.
 
----
+<p align="center">
+  <img src="docs/images/main_workflow.png" alt="RAG Agent architecture: Next.js, FastAPI, LangGraph workflows, SQLite and Elasticsearch" width="650"/>
+</p>
 
-## 📁 Repository Layout
+The application runs as a local, single-user service. The configured user ID scopes retrieval, while selected document IDs and active versions determine which chunks can contribute to an answer.
 
+## Document Ingestion
+
+Uploads are handled in `backend/main.py`, extraction in `backend/loaders.py`, and chunking and indexing in `graphs/index_graph.py`. Accepted files are saved locally before an in-process background task parses and indexes them. Parsing and indexing run serially.
+
+<p align="center">
+  <img src="docs/images/ingestion_workflow.png" alt="Document ingestion with file hashing, OCR, chunking, versioned indexing and failure recovery" width="650"/>
+</p>
+
+| Step | Responsibility |
+| :--- | :--- |
+| File validation | Check the filename, supported extension, non-empty content and upload size |
+| Content fingerprint | Compute SHA-256 over the original file bytes and compare it with stored hashes of the same file type |
+| `load_documents` | Extract document text and attach source, document ID and page metadata where available |
+| `prepare_docs` | Attach the configured user ID and split text into chunks of up to 800 characters with 120-character overlap |
+| `index_docs` | Generate embeddings and write chunks with version metadata and deterministic IDs; refresh the index before activation |
+| Version activation | Commit the active version in SQLite, then clean up obsolete vectors and original files |
+
+**Supported formats:**
+
+| Format | Extraction |
+| :--- | :--- |
+| TXT, Markdown | Decode UTF-8, with a GB18030 fallback |
+| DOCX | Extract paragraphs and table text from the document XML |
+| PDF | Extract embedded text page by page; use PaddleOCR on pages without extracted text |
+| PNG, JPG, JPEG, WebP | Extract text with PaddleOCR |
+
+The default limits are 20 MB per file, 200 pages per PDF and 2 million extracted characters. PDF page numbers are retained for citations. DOCX layout and embedded images are not preserved; PDF pages containing both text and images do not receive additional OCR for their image regions.
+
+## Incremental Updates
+
+Updates operate at the **document level**. Matching raw file bytes and file type skip parsing and embedding. Renaming a file without changing its bytes or type still counts as a duplicate. Files with the same extracted text but different binary contents are not necessarily duplicates.
+
+| Scenario | Behavior |
+| :--- | :--- |
+| Upload content already indexed | Return the existing document with `unchanged: true` |
+| Upload content already being processed | Return the document associated with the pending version |
+| Update an existing document with unchanged content | Keep the current version and skip indexing |
+| Update with changed content | Keep the document ID, build a new version, then activate it |
+| New-version processing fails | Retain the previous ready version and expose an error for retry |
+| Old-version cleanup fails | Retain cleanup records and retry after a later update or server restart |
+| Server restarts during processing | Discard the interrupted pending version; preserve the previous ready version, if any |
+
+While an existing document is updating, it remains `ready` with `updating: true`, so questions can still use its previous version. The backend switches versions only after indexing succeeds. Retrieval filters exclude obsolete and partially written versions.
+
+SQLite schema changes are additive. Existing ready documents use a `legacy` version that matches Elasticsearch chunks without version metadata; their file hashes are populated when needed. Existing documents do not require immediate re-indexing.
+
+Changed documents are fully re-embedded. Chunk-level vector reuse and automatic rebuilds after model or splitter configuration changes are not implemented. A matching filename alone never overwrites a document: use the update endpoint or select an update target in the UI.
+
+## Retrieval Graph
+
+The question-answering workflow is defined in `graphs/graph.py`. The API first verifies that selected documents are ready and captures their active versions. The graph prepares a search query, retrieves matching chunks and generates an answer from those passages.
+
+<p align="center">
+  <img src="docs/images/retrieval_workflow.png" alt="Retrieval graph with conversational query rewriting, version-filtered search and cited answers" width="650"/>
+</p>
+
+| Step | Responsibility |
+| :--- | :--- |
+| `prepare_query` | Use the original question for the first message; generate a structured search query from conversation history for follow-ups |
+| `retrieve` | Search Elasticsearch for up to five chunks, filtered by user ID, selected document IDs and their active versions |
+| `answer` | Generate an answer using the retrieved passages and numbered citations; return a no-results message if retrieval returns no chunks |
+| API response mapping | Return the answer and retrieved source passages, including PDF page numbers when present |
+
+The answer prompt instructs the model to use only the supplied documents, say when the answer is unavailable, and treat document contents as untrusted data. The service checks that returned evidence belongs to the selected documents and versions. Conversations are supplied by the browser on each request; the backend does not persist chat threads.
+
+## Technology Stack
+
+| Layer | Technology | Purpose |
+| :--- | :--- | :--- |
+| Workflow engine | LangGraph | Explicit ingestion and retrieval graphs |
+| RAG framework | LangChain | Documents, splitters, retrievers and model integration |
+| Language models | OpenAI | Query rewriting and grounded answer generation |
+| Embeddings | OpenAI Embeddings | Vector representations of document chunks and queries |
+| Search storage | Elasticsearch, `langchain-elasticsearch` | Vector retrieval and metadata filtering |
+| API runtime | FastAPI, Uvicorn, Pydantic | Upload, update, delete and chat endpoints |
+| Frontend | Next.js, React, TypeScript, Tailwind CSS | Document management, chat and source inspection |
+| Document catalog | SQLite | Document metadata, hashes, processing state and versions |
+| Original files | Local filesystem | Uploaded documents and version-specific originals |
+| OCR and PDF | PaddleOCR, PaddlePaddle, pypdfium2 | Image recognition and PDF text extraction |
+| Configuration | python-dotenv, dataclasses | Environment loading and graph configuration |
+
+## Project Structure
+
+```text
+rag-agent/
+|-- backend/
+|   |-- main.py                  # FastAPI endpoints and background processing
+|   |-- service.py               # Graph adapters, version filters and ES deletion
+|   |-- storage.py               # SQLite catalog, migrations and version state
+|   |-- loaders.py               # Text, DOCX, PDF and image extraction
+|   |-- settings.py              # Backend environment configuration
+|   |-- requirements.txt         # Python dependencies
+|   |-- tests/                   # API, incremental update and graph adapter tests
+|   |-- data/                    # Runtime catalog and uploads
+|-- graphs/
+|   |-- index_graph.py           # Chunking and vector indexing graph
+|   |-- graph.py                 # Query preparation, retrieval and answer graph
+|   |-- retrieval.py             # Embedding model and Elasticsearch retriever
+|   |-- ocr.py                   # Lazy, serialized PaddleOCR integration
+|   |-- configuration.py         # Runnable graph configuration
+|   |-- state.py                 # Graph state and document reducers
+|   |-- schema.py                # Structured search query output
+|   |-- prompts.py               # Query generation and answer prompts
+|   |-- utils.py                 # Message and date helpers
+|-- frontend/
+|   |-- src/app/page.tsx         # Document management and chat interface
+|   |-- src/app/api/backend/
+|   |   |-- [...path]/route.ts   # Server-side proxy to FastAPI
+|   |-- src/lib/                 # UI types
+|   |-- package.json            # Frontend dependencies and scripts
+|-- docs/
+|   |-- images/                 # README workflow images
+|   |-- diagrams/               # Editable Excalidraw source files
+|-- .env                        # Local configuration; do not commit credentials
+|-- README.md
 ```
-.
-├─ data_collect.py          # Field collection: mmcli + iperf3 (1 Hz throughput & KPIs) → raw CSV
-├─ data_merge.ipynb         # Align & clean raw modem/GPS/iperf3 streams to a single 1 Hz timeline
-├─ persistent_ar1.py        # Baselines: Persistence, AR(1); includes a simple RF check; unified metrics
-├─ rf.py                    # Random Forest (residual target y_{t+1} - y_t) + feature selection + scaling
-├─ ann.py                   # MLP/ANN with the same engineered features & evaluation protocol
-├─ tcn.py                   # Temporal Convolutional Network (causal/dilated convs, early stopping)
-├─ tcn+dqn.ipynb            # Hybrid TCN + DQN experiment (policy/threshold refinement on TCN output)
-└─ thesis.pdf               # The dissertation (rename of 9c5cc53e-fffc-44cb-983a-527f2f6d3ad8.pdf)
-```
 
-> Tip: you can rename the provided thesis PDF to `thesis.pdf` in the repository.
+## Backend API Reference
 
----
+The FastAPI backend defaults to `http://127.0.0.1:8000` in the local setup below. The browser uses `/api/backend/*` on the Next.js server, which forwards allowed requests to the configured backend.
 
-## 🧰 Environment
+| Method | Endpoint | Description | Response |
+| :--- | :--- | :--- | :--- |
+| GET | `/health` | Check that the API is running | Status, local mode and `dependencies_checked: false` |
+| GET | `/documents` | List catalog entries | `documents` array |
+| POST | `/documents` | Upload multipart field `file` | `document`, `unchanged`; 202 for processing or 200 for an indexed duplicate |
+| PUT | `/documents/{id}/content` | Replace the content of an existing document | `document`, `unchanged`; 202 for processing or 200 for unchanged content |
+| DELETE | `/documents/{id}` | Delete the document, its versions and original files | 204 on success |
+| POST | `/chat` | Ask a question against selected ready documents | `answer`, `citations` |
 
-- **Python** 3.10+ (recommended)
-- **Core:** `numpy`, `pandas`, `scikit-learn`, `matplotlib`
-- **Deep learning:** `tensorflow` (for ANN/TCN)
-- **Notebooks:** `jupyter` (for the `*.ipynb` files)
-- **Collection (optional, Linux):** `modemmanager` (`mmcli`), `iperf3`
+Example chat payload:
 
-Quick install:
-
-```bash
-pip install numpy pandas scikit-learn tensorflow matplotlib jupyter
-# optional for collection
-# sudo apt-get install modemmanager iperf3
-```
-
----
-
-## 📦 Data Expectations
-
-Most training scripts expect a **processed** CSV at the repo root, named **`data_filled.csv`**, with at least:
-
-- `timestamp` (UTC), `modem_id`, `downlink_mbps`
-- If available: `rssi, rsrp, rsrq, snr, speed_gps, cell_id, ...`
-
-The collection script `data_collect.py` writes raw CSVs (default `modem_downlink_only.csv`) from `mmcli` and `iperf3`. Use `data_merge.ipynb` to **align** and **clean** the raw streams into the 1 Hz `data_filled.csv` used by the models.
-
----
-
-## 🚀 Quick Start (with processed data)
-
-1. **Place** your processed **`data_filled.csv`** in the repository root.
-2. **Run** any of the following (each trains & evaluates **per‑modem**, using the same split/embargo and metrics):
-
-```bash
-# Baselines: Persistence + AR(1) + a simple RF sanity check
-python persistent_ar1.py
-
-# Random Forest (thesis best overall)
-python rf.py
-
-# MLP / ANN (same engineered features and protocol)
-python ann.py
-
-# Temporal Convolutional Network (causal/dilated)
-python tcn.py
-```
-
-Each script prints a per‑modem summary (R², MAE, MAPE vs current, and useful distributional stats).
-
----
-
-## 🧪 Reproducibility & Evaluation Protocol
-
-- **Objective:** one‑step forecast **`y_{t+1}`** (next‑second downlink Mbps). Many scripts learn the **residual** `y_{t+1} - y_t` and add back `y_t` at inference.
-- **Split:** time‑ordered; last **20%** as **test**, with a **25 s embargo** immediately before test to prevent look‑ahead via lagged features.
-- **Adjacency constraint:** evaluate only pairs with **Δt ≤ 1.1 s** (tightly 1 Hz).
-- **Metrics:** MAE (Mbps), R², and percentage errors w.r.t. current rate (MAPE‑style; treat near‑zero throughput with caution).
-
-These rules are encoded in the training scripts; no extra config needed for a standard run.
-
----
-
-## ⚙️ Configuration (key defaults)
-
-- **Feature lags:** throughput lags **1..20 s**, radio‑KPI lags **1..3 s**.
-- **Rolling stats:** window **5 s** (mean/std/min/max).
-- **Feature selection:** `SelectKBest(f_regression)` up to **30** features; `RobustScaler` for stability.
-- **Split & safety:** `test_ratio=0.2`, **25 s embargo**, adjacency **≤ 1.1 s**.
-- **Training (ANN/TCN):** early stopping (`patience=15`), `ReduceLROnPlateau`, small min‑LR, light hyper‑param tuning toggles.
-- **Percentage error floor:** 0.1 Mbps to avoid division blow‑ups at ~0 throughput.
-
-Script‑specific notes:
-
-- `ann.py` reads `CFG.input_csv` (default **`data_filled.csv`**).
-- `rf.py` and `persistent_ar1.py` read **`data_filled.csv`** directly.
-- `tcn.py` accepts `--data PATH` (defaults to a CSV path); it builds features internally before training.
-
----
-
-## 📊 Key Results (from the thesis)
-
-On two representative modems in the held‑out test split:
-
-| Model             | R² (M1)  | MAE (Mbps, M1) | R² (M2)  | MAE (Mbps, M2) |
-| ----------------- | :------: | :------------: | :------: | :------------: |
-| Persistence       |    —     |       —        |    —     |       —        |
-| AR(1)             |  -0.49   |      35.6      |  -0.50   |      33.2      |
-| **Random Forest** | **0.53** |    **17.1**    | **0.37** |    **19.5**    |
-| ANN / MLP         |  ~0.51   |     ~18–20     |  ~0.21   |     ~23–24     |
-| TCN               |  ~0.23   |     ~24–25     |  ~0.10   |     ~25–26     |
-| TCN + DQN         |  ~0.19   |     ~25–30     |  ~0.11   |      ~30       |
-
-> RF consistently achieves the best accuracy–robustness trade‑off in this small‑sample, rapidly varying setting. See **`thesis.pdf`** for complete tables (incl. MAPE and distributional quantiles).
-
----
-
-## 🧱 (Optional) Data Collection Workflow
-
-1. **Hardware & setup:** Linux SBC + 3× USB cellular modems (multiple operators).
-2. **KPIs:** use `mmcli` to poll RSRP/RSRQ/RSSI/SNR, EARFCN, RAT, MCC/MNC, TAC, Cell ID, etc., at 1 Hz.
-3. **Throughput:** run `iperf3` in **reverse** (server → client) downlink mode; parse per‑second rates.
-4. **GPS:** 1 Hz phone GPS; ensure UTC synchronization with the SBC.
-5. **Merge:** align modem/GPS/iperf3 streams to a single 1 Hz axis; carefully handle gaps/handovers (no cross‑segment forward‑fill); clamp outliers (e.g., [0, 200] Mbps).
-
-`data_collect.py` shows a minimal reference implementation (concurrency for `iperf3`, `mmcli` parsing, CSV writing).
-
----
-
-## 🔁 Re‑running the Thesis Experiments
-
-- Use `data_merge.ipynb` to reproduce the **processed** dataset used in the thesis (`data_filled.csv`).
-- Then run `rf.py`, `ann.py`, and `tcn.py` as above.
-- For the hybrid experiment, open `tcn+dqn.ipynb` and follow the notebook cells.
-
----
-
-## 📄 License
-
-Choose a license that fits your needs (e.g., **MIT** or **Apache‑2.0**). Add a `LICENSE` file at the repo root.
-
----
-
-## 📝 Citation
-
-If this repository or the associated thesis is useful to your research, please cite it. Replace placeholders below with your final bibliographic information.
-
-```
-@thesis{<your-key>,
-  title   = {Short-Term Downlink Throughput Prediction on Trains},
-  author  = {<Your Name>},
-  school  = {<Your University/Department>},
-  year    = {2025},
-  note    = {Code and data processing pipelines available at <your GitHub URL>}
+```json
+{
+  "conversation_id": "b3a59114-43b7-4a2a-b742-79d36daa83fd",
+  "document_ids": ["d2c98772-74da-4c20-a7b5-325b8f066aac"],
+  "messages": [
+    {"role": "user", "content": "What are the main findings in this document?"}
+  ]
 }
 ```
 
----
+Replace `document_ids` with IDs returned by the document API. `conversation_id` is validated as a UUID but is not a persisted server-side thread.
 
-## 🙏 Acknowledgements
+### Frontend Response Mapping
 
-Thanks to everyone who helped with data collection and to the network operators whose infrastructure made this study possible.
+| Field | Description |
+| :--- | :--- |
+| `document.id`, `name`, `kind`, `size` | Stable document ID, filename, file type and size in bytes |
+| `status` | `processing`, `ready` or `error` |
+| `updating` | Whether a replacement or initial version is being processed |
+| `addedAt`, `updatedAt` | Initial upload time and latest successful activation time |
+| `excerpt`, `error` | Extracted text preview and processing error message |
+| `answer` | Assistant response for the current turn |
+| `citations` | Retrieved passages with `documentId`, `name`, `excerpt` and optional `page` |
+
+Chat requests accept 1–50 selected document IDs and 1–80 messages, with a maximum of 8,000 characters per message and 100,000 characters in the conversation. The last message must be from the user. The UI waits for the complete response rather than streaming tokens.
+
+## Frontend
+
+The Next.js interface in `frontend/` provides:
+
+- **Document uploads** with file type and size guidance.
+- **Content updates** through an explicit update target while preserving document selection by ID.
+- **Processing status** refreshed every three seconds while documents are being processed.
+- **Source selection** to limit questions to chosen ready documents.
+- **Conversational chat** with follow-up questions and a clear-chat action.
+- **Source inspection** through expandable retrieved passages and available page references.
+- **Document deletion** with confirmation and backend cleanup.
+
+Click **Update** beside a document, select the replacement file and click **Update file**. Identical content is skipped. Chat history exists only in the current page and is cleared on refresh; uploaded documents persist in the backend.
+
+## Configuration
+
+Backend settings load `backend/.env` first, then the root `.env`, without overriding existing process environment variables. Graph configuration receives these settings through `RagService`. Restart the backend after changing its configuration.
+
+| Setting | Default | Description |
+| :--- | :--- | :--- |
+| `OPENAI_API_KEY` | Required | Credential for the configured OpenAI models |
+| `RAG_ELASTICSEARCH_URL` | Falls back to `ELASTICSEARCH_URL` | Elasticsearch address used for indexing, retrieval and deletion |
+| `ELASTICSEARCH_URL` | Required when no override is set | Base Elasticsearch address |
+| `ELASTICSEARCH_USER` | Required for `elastic-local` | Elasticsearch username |
+| `ELASTICSEARCH_PASSWORD` | Required for `elastic-local` | Elasticsearch password |
+| `ELASTICSEARCH_API_KEY` | Required for `elastic-cloud` | API key used with the configured Elasticsearch URL |
+| `RAG_RETRIEVER_PROVIDER` | `elastic-local` | Choose `elastic-local` or `elastic-cloud` |
+| `RAG_INDEX_NAME` | `folio_documents_v1` | Index used by the web application |
+| `RAG_USER_ID` | `local-user` | Fixed server-side retrieval scope; not an authenticated identity |
+| `RAG_DATA_DIR` | `backend/data` | SQLite catalog and uploaded original files |
+| `RAG_EMBEDDING_MODEL` | `text-embedding-3-small` | Embedding model used for documents and queries |
+| `RAG_CHAT_MODEL` | `gpt-4.1-mini` | Answer model; choose one available to your account |
+| `RAG_QUERY_MODEL` | Value of `RAG_CHAT_MODEL` | Follow-up query model with structured-output support |
+| `RAG_OCR_LANGUAGE` | `en` | PaddleOCR recognition language; use `ch` for Chinese/mixed documents |
+| `RAG_API_URL` | Required by the frontend proxy | FastAPI address, set in `frontend/.env.local` |
+
+Direct graph calls use the defaults in `graphs/configuration.py`, including the index `langchain_index`. The web API supplies its own settings through `RagService`; indexing through a direct graph call does not create a web catalog entry.
+
+## Getting Started
+
+### Prerequisites
+
+- Python 3.12, matching the environment used to verify this project.
+- Node.js and npm compatible with the Next.js version in `frontend/package.json`.
+- A running Elasticsearch service with vector-search support and valid credentials.
+- An OpenAI API key with access to the configured chat and embedding models.
+
+PaddleOCR runs on CPU in the current implementation. Its first use may download recognition models. Elasticsearch must be started separately; the repository does not include a Docker Compose deployment.
+
+### Installation
+
+The examples below use Windows PowerShell. Run them from the project root:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r backend/requirements.txt
+
+cd frontend
+npm install
+cd ..
+```
+
+### Environment Variables
+
+Create `.env` in the repository root and replace the placeholders:
+
+```dotenv
+OPENAI_API_KEY=your_openai_api_key
+
+ELASTICSEARCH_URL=http://127.0.0.1:9200
+ELASTICSEARCH_USER=your_elasticsearch_user
+ELASTICSEARCH_PASSWORD=your_elasticsearch_password
+RAG_RETRIEVER_PROVIDER=elastic-local
+RAG_INDEX_NAME=folio_documents_v1
+RAG_USER_ID=local-user
+
+RAG_EMBEDDING_MODEL=text-embedding-3-small
+RAG_CHAT_MODEL=gpt-4.1-mini
+RAG_QUERY_MODEL=gpt-4.1-mini
+RAG_OCR_LANGUAGE=en
+```
+
+Use the URL and protocol exposed by your Elasticsearch service. HTTPS deployments require valid certificate trust. Keep credentials out of version control.
+
+Create `frontend/.env.local`:
+
+```dotenv
+RAG_API_URL=http://127.0.0.1:8000
+```
+
+### Running the Application Locally
+
+Open two terminals in the repository root.
+
+**Terminal 1 — backend:**
+
+```powershell
+$env:PYTHONUTF8 = "1"
+.\.venv\Scripts\python.exe -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --workers 1
+```
+
+**Terminal 2 — frontend:**
+
+```powershell
+cd frontend
+npm run dev
+```
+
+Open [the document chat interface](http://127.0.0.1:3000). Upload a document, wait until it is ready, select it and ask a question. The [interactive API documentation](http://127.0.0.1:8000/docs) exposes the backend request schemas.
+
+The [health endpoint](http://127.0.0.1:8000/health) checks only that the API is running; it does not verify Elasticsearch or model-provider connectivity. If the UI cannot reach the backend, check both processes and `RAG_API_URL`. Restart the frontend after changing `.env.local`.
+
+## Verification
+
+Run the backend tests from the project root:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s backend/tests -v
+```
+
+Check the frontend:
+
+```powershell
+cd frontend
+npm run typecheck
+npm run build
+```
+
+Tests cover document APIs, file validation, duplicate detection, version activation, failure recovery, legacy catalog migration, retrieval filters and graph adapters. External search and model services are replaced with test doubles; passing tests does not establish that a live Elasticsearch instance or model account is configured correctly.
+
+Workflow images are stored in `docs/images/`. Their editable sources are in `docs/diagrams/` and can be opened in [Excalidraw](https://excalidraw.com).
+
+## Current Scope
+
+This is a local, single-user application. It does not implement login, RBAC, multi-tenant authorization, a durable job queue, cloud deployment or automatic scaling. Backend coordination uses in-process locks, so run one worker. Interrupted jobs require a manual update retry after recovery.
+
+Document contents are sent to the configured embedding and chat services when those operations run. Uploaded originals and catalog records are stored on the backend filesystem. Chat persistence, live token streaming and chunk-level embedding reuse are outside the current implementation.
